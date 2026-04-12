@@ -1,5 +1,4 @@
 # tf-workflows: Gemini AI Review (Reusable Workflow)
-# セキュリティ・構造面のクロスレビュー
 name: "AI Review - Gemini"
 
 on:
@@ -41,55 +40,50 @@ jobs:
           path: tf-workflows
           sparse-checkout: prompts
 
-      - name: Load prompts
-        id: prompts
-        run: |
-          REVIEW_PROMPT=$(cat tf-workflows/prompts/gemini-review-prompt.md)
-          CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
-          echo "review_prompt<<PROMPT_EOF" >> "$GITHUB_OUTPUT"
-          echo "$REVIEW_PROMPT" >> "$GITHUB_OUTPUT"
-          echo "PROMPT_EOF" >> "$GITHUB_OUTPUT"
-          echo "checklist<<CHECKLIST_EOF" >> "$GITHUB_OUTPUT"
-          echo "$CHECKLIST" >> "$GITHUB_OUTPUT"
-          echo "CHECKLIST_EOF" >> "$GITHUB_OUTPUT"
-
       - name: Run Gemini Review
-        id: review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           DIFF=$(cat pr_diff.txt)
-          PHASE="${{ inputs.phase }}"
+          SYSTEM_PROMPT=$(cat tf-workflows/prompts/gemini-review-prompt.md)
+          CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
 
-          RESPONSE=$(curl -s \
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=$GEMINI_API_KEY" \
+          # リクエストJSONをファイルに書き出し（シェル展開の問題を回避）
+          jq -n \
+            --arg prompt "$SYSTEM_PROMPT" \
+            --arg checklist "$CHECKLIST" \
+            --arg diff "$DIFF" \
+            --arg phase "${{ inputs.phase }}" \
+            '{
+              system_instruction: { parts: [{ text: $prompt }] },
+              contents: [{
+                parts: [{
+                  text: ("## チェックリスト（Phase " + $phase + "）\n\n" + $checklist + "\n\n## PR差分\n```diff\n" + $diff + "\n```\n\n上記の差分をセキュリティ・構造の観点でレビューしてください。")
+                }]
+              }],
+              generationConfig: {
+                maxOutputTokens: 4096,
+                temperature: 0.2
+              }
+            }' > /tmp/gemini_request.json
+
+          # Gemini API 呼び出し
+          HTTP_CODE=$(curl -s -o /tmp/gemini_response.json -w "%{http_code}" \
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d "$(jq -n \
-              --arg prompt "${{ steps.prompts.outputs.review_prompt }}" \
-              --arg checklist "${{ steps.prompts.outputs.checklist }}" \
-              --arg diff "$DIFF" \
-              --arg phase "$PHASE" \
-              '{
-                system_instruction: { parts: [{ text: $prompt }] },
-                contents: [{
-                  parts: [{
-                    text: "## チェックリスト（Phase \($phase)）\n\n\($checklist)\n\n## PR差分\n```diff\n\($diff)\n```\n\n上記の差分をセキュリティ・構造の観点でレビューしてください。"
-                  }]
-                }],
-                generationConfig: {
-                  maxOutputTokens: 4096,
-                  temperature: 0.2
-                }
-              }'
-            )")
+            -d @/tmp/gemini_request.json)
 
-          REVIEW_BODY=$(echo "$RESPONSE" | jq -r '.candidates[0].content.parts[0].text // "レビュー結果の取得に失敗しました"')
+          echo "Gemini API HTTP status: $HTTP_CODE"
 
-          echo "review_body<<REVIEW_EOF" >> "$GITHUB_OUTPUT"
-          echo "$REVIEW_BODY" >> "$GITHUB_OUTPUT"
-          echo "REVIEW_EOF" >> "$GITHUB_OUTPUT"
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "API Error Response:"
+            cat /tmp/gemini_response.json
+            echo "レビュー結果の取得に失敗しました（HTTP $HTTP_CODE）" > /tmp/review_body.md
+          else
+            jq -r '.candidates[0].content.parts[0].text // "レビュー結果の取得に失敗しました"' /tmp/gemini_response.json > /tmp/review_body.md
+          fi
 
-          if echo "$REVIEW_BODY" | grep -q "🔴致命"; then
+          if grep -q "🔴致命" /tmp/review_body.md; then
             echo "has_critical=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_critical=false" >> "$GITHUB_OUTPUT"
@@ -99,22 +93,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          COMMENT_BODY="## 🔍 Gemini AI Review (Phase ${{ inputs.phase }})
+          {
+            echo "## 🔍 Gemini AI Review (Phase ${{ inputs.phase }})"
+            echo ""
+            cat /tmp/review_body.md
+            echo ""
+            echo "---"
+            echo "*Review by Gemini | Phase: ${{ inputs.phase }}*"
+          } > /tmp/comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/comment.md
 
-          ${{ steps.review.outputs.review_body }}
-
-          ---
-          *Review by Gemini | Phase: ${{ inputs.phase }}*"
-
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$COMMENT_BODY"
-
-      - name: Apply critical label if needed
+      - name: Block merge if critical
         if: steps.review.outputs.has_critical == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh pr edit ${{ github.event.pull_request.number }} \
-            --add-label "🔴 CRITICAL (Gemini)"
+          gh pr edit ${{ github.event.pull_request.number }} --add-label "🔴 CRITICAL (Gemini)" || true
           echo "::error::Gemini が致命的な指摘を検出しました。"
           exit 1
