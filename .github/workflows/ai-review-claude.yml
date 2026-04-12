@@ -1,5 +1,4 @@
 # tf-workflows: Claude AI Review (Reusable Workflow)
-# 呼び出し元の各リポから workflow_call で利用する
 name: "AI Review - Claude"
 
 on:
@@ -34,24 +33,10 @@ jobs:
           fetch-depth: 0
 
       - name: Get PR diff
-        id: diff
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh pr diff ${{ github.event.pull_request.number }} > pr_diff.txt
-          echo "diff_size=$(wc -c < pr_diff.txt)" >> "$GITHUB_OUTPUT"
-
-      - name: Check diff size
-        id: check_size
-        run: |
-          DIFF_SIZE=${{ steps.diff.outputs.diff_size }}
-          # 100KB 以上の差分は分割が必要（API制限対策）
-          if [ "$DIFF_SIZE" -gt 100000 ]; then
-            echo "large_diff=true" >> "$GITHUB_OUTPUT"
-            echo "::warning::差分が大きいため、レビュー精度が低下する可能性があります"
-          else
-            echo "large_diff=false" >> "$GITHUB_OUTPUT"
-          fi
 
       - name: Checkout tf-workflows (prompts)
         uses: actions/checkout@v4
@@ -60,39 +45,24 @@ jobs:
           path: tf-workflows
           sparse-checkout: prompts
 
-      - name: Load prompts
-        id: prompts
-        run: |
-          REVIEW_PROMPT=$(cat tf-workflows/prompts/claude-review-prompt.md)
-          CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
-          # Phase に応じたチェックリスト範囲を設定
-          echo "review_prompt<<PROMPT_EOF" >> "$GITHUB_OUTPUT"
-          echo "$REVIEW_PROMPT" >> "$GITHUB_OUTPUT"
-          echo "PROMPT_EOF" >> "$GITHUB_OUTPUT"
-          echo "checklist<<CHECKLIST_EOF" >> "$GITHUB_OUTPUT"
-          echo "$CHECKLIST" >> "$GITHUB_OUTPUT"
-          echo "CHECKLIST_EOF" >> "$GITHUB_OUTPUT"
-
       - name: Run Claude Review
-        id: review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           DIFF=$(cat pr_diff.txt)
-          PHASE="${{ inputs.phase }}"
-          REVIEW_LEVEL="${{ inputs.review_level }}"
+          SYSTEM_PROMPT=$(cat tf-workflows/prompts/claude-review-prompt.md)
+          CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
 
-          # Claude API 呼び出し
           RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
             -d "$(jq -n \
-              --arg system "${{ steps.prompts.outputs.review_prompt }}" \
-              --arg checklist "${{ steps.prompts.outputs.checklist }}" \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg checklist "$CHECKLIST" \
               --arg diff "$DIFF" \
-              --arg phase "$PHASE" \
-              --arg level "$REVIEW_LEVEL" \
+              --arg phase "${{ inputs.phase }}" \
+              --arg level "${{ inputs.review_level }}" \
               '{
                 model: "claude-sonnet-4-20250514",
                 max_tokens: 4096,
@@ -104,22 +74,14 @@ jobs:
               }'
             )")
 
-          # レスポンスからレビュー本文を抽出
-          REVIEW_BODY=$(echo "$RESPONSE" | jq -r '.content[0].text // "レビュー結果の取得に失敗しました"')
+          echo "$RESPONSE" | jq -r '.content[0].text // "レビュー結果の取得に失敗しました"' > /tmp/review_body.md
 
-          echo "review_body<<REVIEW_EOF" >> "$GITHUB_OUTPUT"
-          echo "$REVIEW_BODY" >> "$GITHUB_OUTPUT"
-          echo "REVIEW_EOF" >> "$GITHUB_OUTPUT"
-
-          # 致命的指摘の有無を判定
-          if echo "$REVIEW_BODY" | grep -q "🔴致命"; then
+          if grep -q "🔴致命" /tmp/review_body.md; then
             echo "has_critical=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_critical=false" >> "$GITHUB_OUTPUT"
           fi
-
-          # 警告の有無を判定
-          if echo "$REVIEW_BODY" | grep -q "🟡警告"; then
+          if grep -q "🟡警告" /tmp/review_body.md; then
             echo "has_warning=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_warning=false" >> "$GITHUB_OUTPUT"
@@ -129,29 +91,27 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          COMMENT_BODY="## 🤖 Claude AI Review (Phase ${{ inputs.phase }})
-
-          ${{ steps.review.outputs.review_body }}
-
-          ---
-          *Review by Claude | Level: ${{ inputs.review_level }} | Phase: ${{ inputs.phase }}*"
-
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$COMMENT_BODY"
+          {
+            echo "## 🤖 Claude AI Review (Phase ${{ inputs.phase }})"
+            echo ""
+            cat /tmp/review_body.md
+            echo ""
+            echo "---"
+            echo "*Review by Claude | Level: ${{ inputs.review_level }} | Phase: ${{ inputs.phase }}*"
+          } > /tmp/comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/comment.md
 
       - name: Apply labels
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           PR_NUMBER=${{ github.event.pull_request.number }}
-
           if [ "${{ steps.review.outputs.has_critical }}" = "true" ]; then
-            gh pr edit "$PR_NUMBER" --add-label "🔴 CRITICAL"
-            echo "::error::致命的な指摘が見つかりました。修正が必要です。"
+            gh pr edit "$PR_NUMBER" --add-label "🔴 CRITICAL" || true
           elif [ "${{ steps.review.outputs.has_warning }}" = "true" ]; then
-            gh pr edit "$PR_NUMBER" --add-label "🟡 WARNING"
+            gh pr edit "$PR_NUMBER" --add-label "🟡 WARNING" || true
           else
-            gh pr edit "$PR_NUMBER" --add-label "✅ AI Review Passed"
+            gh pr edit "$PR_NUMBER" --add-label "✅ AI Review Passed" || true
           fi
 
       - name: Block merge if critical
