@@ -1,0 +1,150 @@
+# tf-workflows: Firestore Rules Security Check (Reusable Workflow)
+# firestore.rules の変更を検知して追加セキュリティレビューを実行
+name: "Security Check - Firestore Rules"
+
+on:
+  workflow_call:
+    inputs:
+      rules_path:
+        description: "firestore.rules のパス"
+        required: false
+        default: "firestore.rules"
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check-rules-changed:
+    runs-on: ubuntu-latest
+    outputs:
+      rules_changed: ${{ steps.filter.outputs.rules }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rules:
+              - '${{ inputs.rules_path }}'
+              - '**/firestore.rules'
+
+  security-review:
+    needs: check-rules-changed
+    if: needs.check-rules-changed.outputs.rules_changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get rules diff
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # firestore.rules の差分だけ取得
+          gh pr diff ${{ github.event.pull_request.number }} \
+            -- '${{ inputs.rules_path }}' > rules_diff.txt || true
+
+          # 全文も取得（コンテキスト用）
+          if [ -f "${{ inputs.rules_path }}" ]; then
+            cat "${{ inputs.rules_path }}" > rules_full.txt
+          fi
+
+      - name: Run security review
+        id: review
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          DIFF=$(cat rules_diff.txt)
+          FULL_RULES=""
+          if [ -f rules_full.txt ]; then
+            FULL_RULES=$(cat rules_full.txt)
+          fi
+
+          SYSTEM_PROMPT="あなたは Firebase Firestore セキュリティルールの専門レビュアーです。
+          以下の観点で厳密にレビューしてください：
+
+          ## 必須チェック項目
+          - S-1: allow read, write: if true になっていないか
+          - S-2: request.auth != null の検証が入っているか
+          - S-3: 他人のドキュメントを読める構造になっていないか（userId スコープ）
+          - S-6: request.resource.data による入力制約があるか
+
+          ## 出力フォーマット（指摘ごとに以下を出力）
+          ### 指摘
+          [何が問題か：1行で]
+
+          ### 根拠
+          [なぜ問題か：ルール上の証拠]
+
+          ### 重大度
+          🔴致命 / 🟡警告 / 🔵情報
+
+          ### 修正案
+          [修正後のルールコード]
+
+          指摘がなければ「✅ セキュリティルールに問題は見つかりませんでした」と出力してください。"
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg diff "$DIFF" \
+              --arg full "$FULL_RULES" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 4096,
+                system: $system,
+                messages: [{
+                  role: "user",
+                  content: "## Firestore Rules の差分\n```diff\n\($diff)\n```\n\n## 現在のルール全文\n```\n\($full)\n```\n\nセキュリティ観点でレビューしてください。"
+                }]
+              }'
+            )")
+
+          REVIEW_BODY=$(echo "$RESPONSE" | jq -r '.content[0].text // "レビュー失敗"')
+
+          echo "review_body<<REVIEW_EOF" >> "$GITHUB_OUTPUT"
+          echo "$REVIEW_BODY" >> "$GITHUB_OUTPUT"
+          echo "REVIEW_EOF" >> "$GITHUB_OUTPUT"
+
+          if echo "$REVIEW_BODY" | grep -q "🔴致命"; then
+            echo "has_critical=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_critical=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post security review comment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMMENT_BODY="## 🔒 Firestore Rules Security Review
+
+          > ⚠️ このPRは \`firestore.rules\` の変更を含んでいます。追加セキュリティレビューを実行しました。
+
+          ${{ steps.review.outputs.review_body }}
+
+          ---
+          *Firestore Security Check by Claude*"
+
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --body "$COMMENT_BODY"
+
+      - name: Block merge if critical
+        if: steps.review.outputs.has_critical == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr edit ${{ github.event.pull_request.number }} \
+            --add-label "🔴 SECURITY CRITICAL"
+          echo "::error::🔒 Firestore ルールに致命的なセキュリティ問題が見つかりました。"
+          exit 1

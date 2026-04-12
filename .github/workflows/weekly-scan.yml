@@ -1,0 +1,190 @@
+# tf-workflows: Weekly Full Scan (Reusable Workflow)
+# 毎週土曜夜にリポ全体をスキャンし、見落としや設計の歪みを検出
+name: "Weekly Full Scan"
+
+on:
+  workflow_call:
+    inputs:
+      scan_paths:
+        description: "スキャン対象パス（カンマ区切り）"
+        required: false
+        default: "src"
+        type: string
+      project_name:
+        description: "プロジェクト名（レポート用）"
+        required: true
+        type: string
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  weekly-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tf-workflows (prompts)
+        uses: actions/checkout@v4
+        with:
+          repository: tf-nagai/tf-workflows
+          path: tf-workflows
+          sparse-checkout: prompts
+
+      - name: Collect source files
+        id: collect
+        run: |
+          # スキャン対象のファイルを収集
+          IFS=',' read -ra PATHS <<< "${{ inputs.scan_paths }}"
+          > all_sources.txt
+          for P in "${PATHS[@]}"; do
+            P=$(echo "$P" | xargs)  # trim
+            if [ -d "$P" ]; then
+              find "$P" -type f \( \
+                -name "*.js" -o -name "*.jsx" -o \
+                -name "*.ts" -o -name "*.tsx" -o \
+                -name "*.json" -o -name "*.rules" \
+              \) | head -100 >> all_sources.txt
+            fi
+          done
+
+          # firestore.rules がルートにあれば追加
+          if [ -f "firestore.rules" ]; then
+            echo "firestore.rules" >> all_sources.txt
+          fi
+
+          # .env* の存在チェック
+          ENV_FILES=$(find . -name ".env*" -not -path "./.git/*" 2>/dev/null || true)
+          echo "env_files=$ENV_FILES" >> "$GITHUB_OUTPUT"
+
+          # ファイル一覧
+          FILE_COUNT=$(wc -l < all_sources.txt)
+          echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "📁 スキャン対象: $FILE_COUNT ファイル"
+
+      - name: Build source bundle
+        run: |
+          # ファイル内容をバンドル（トークン制限を意識して先頭50ファイル）
+          > source_bundle.txt
+          head -50 all_sources.txt | while read -r file; do
+            echo "=== FILE: $file ===" >> source_bundle.txt
+            head -300 "$file" >> source_bundle.txt
+            echo "" >> source_bundle.txt
+          done
+
+          BUNDLE_SIZE=$(wc -c < source_bundle.txt)
+          echo "📦 バンドルサイズ: $BUNDLE_SIZE bytes"
+
+          # 大きすぎる場合は警告
+          if [ "$BUNDLE_SIZE" -gt 200000 ]; then
+            echo "::warning::ソースバンドルが大きいため、スキャン対象を絞り込みます"
+            head -25 all_sources.txt > trimmed_files.txt
+            > source_bundle.txt
+            while read -r file; do
+              echo "=== FILE: $file ===" >> source_bundle.txt
+              head -200 "$file" >> source_bundle.txt
+              echo "" >> source_bundle.txt
+            done < trimmed_files.txt
+          fi
+
+      - name: Run weekly scan
+        id: scan
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SOURCE=$(cat source_bundle.txt)
+          CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
+          PROJECT="${{ inputs.project_name }}"
+
+          SYSTEM_PROMPT="あなたは Firebase アプリの品質監査員です。
+          プロジェクト「${PROJECT}」の週次全量スキャンを実施してください。
+
+          ## スキャン観点
+          1. チェックリストの全項目に照らした確認
+          2. ファイル間の設計一貫性（命名規則、エラーハンドリングパターン等）
+          3. 技術的負債の蓄積傾向
+          4. セキュリティリスクの見落とし
+
+          ## 出力フォーマット
+          # 週次スキャンレポート: ${PROJECT}
+          ## 日付: $(date +%Y-%m-%d)
+
+          ### サマリー
+          - 🔴致命: X件 / 🟡警告: X件 / 🔵情報: X件
+
+          ### 指摘一覧
+          （指摘ごとに ID・重大度・内容・該当ファイル・修正案を記載）
+
+          ### 全体設計の所見
+          （設計の一貫性、技術的負債について）
+
+          ### 推奨アクション
+          （優先度順）"
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: $ANTHROPIC_API_KEY" \
+            -H "anthropic-version: 2023-06-01" \
+            -d "$(jq -n \
+              --arg system "$SYSTEM_PROMPT" \
+              --arg checklist "$CHECKLIST" \
+              --arg source "$SOURCE" \
+              '{
+                model: "claude-sonnet-4-20250514",
+                max_tokens: 8192,
+                system: $system,
+                messages: [{
+                  role: "user",
+                  content: "## チェックリスト\n\n\($checklist)\n\n## ソースコード\n\($source)\n\n週次全量スキャンを実施してください。"
+                }]
+              }'
+            )")
+
+          SCAN_RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // "スキャン失敗"')
+
+          echo "scan_result<<SCAN_EOF" >> "$GITHUB_OUTPUT"
+          echo "$SCAN_RESULT" >> "$GITHUB_OUTPUT"
+          echo "SCAN_EOF" >> "$GITHUB_OUTPUT"
+
+          # 致命件数をカウント
+          CRITICAL_COUNT=$(echo "$SCAN_RESULT" | grep -c "🔴致命" || true)
+          echo "critical_count=$CRITICAL_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Create issue with scan results
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date +%Y-%m-%d)
+          CRITICAL_COUNT=${{ steps.scan.outputs.critical_count }}
+          TITLE="📊 週次スキャン: ${{ inputs.project_name }} ($DATE)"
+
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            TITLE="🔴 $TITLE - 致命$CRITICAL_COUNT件"
+            LABELS="weekly-scan,critical"
+          else
+            LABELS="weekly-scan"
+          fi
+
+          gh issue create \
+            --title "$TITLE" \
+            --body "${{ steps.scan.outputs.scan_result }}" \
+            --label "$LABELS" || echo "::warning::Issue 作成に失敗（ラベル未作成の可能性）"
+
+      - name: Save report as artifact
+        run: |
+          mkdir -p reports
+          DATE=$(date +%Y-%m-%d)
+          echo "${{ steps.scan.outputs.scan_result }}" > "reports/${DATE}-${{ inputs.project_name }}.md"
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "weekly-scan-${{ inputs.project_name }}-$(date +%Y%m%d)"
+          path: reports/
+          retention-days: 90
