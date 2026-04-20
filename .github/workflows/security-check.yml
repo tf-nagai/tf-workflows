@@ -157,4 +157,3 @@ jobs:
             --add-label "🔴 SECURITY CRITICAL"
           echo "::error::🔒 Firestore ルールに致命的なセキュリティ問題が見つかりました。"
           exit 1
-WORKFLOW_FILE_EOF
