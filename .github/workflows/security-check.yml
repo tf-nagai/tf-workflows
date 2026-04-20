@@ -126,18 +126,27 @@ jobs:
       - name: Post security review comment
         env:
           GH_TOKEN: ${{ github.token }}
+          REVIEW_BODY: ${{ steps.review.outputs.review_body }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          COMMENT_BODY="## 🔒 Firestore Rules Security Review
+          # AIレビュー本文に " $ ` 等が含まれてもbashで展開されないよう、
+          # 環境変数経由で受け取り、ファイル経由で gh pr comment に渡す
+          {
+            cat <<'HEADER_EOF'
+          ## 🔒 Firestore Rules Security Review
 
-          > ⚠️ このPRは \`firestore.rules\` の変更を含んでいます。追加セキュリティレビューを実行しました。
+          > ⚠️ このPRは `firestore.rules` の変更を含んでいます。追加セキュリティレビューを実行しました。
 
-          ${{ steps.review.outputs.review_body }}
+          HEADER_EOF
+            printf '%s\n' "$REVIEW_BODY"
+            cat <<'FOOTER_EOF'
 
           ---
-          *Firestore Security Check by Claude*"
+          *Firestore Security Check by Claude*
+          FOOTER_EOF
+          } > comment.md
 
-          gh pr comment ${{ github.event.pull_request.number }} \
-            --body "$COMMENT_BODY"
+          gh pr comment "$PR_NUMBER" --body-file comment.md
 
       - name: Block merge if critical
         if: steps.review.outputs.has_critical == 'true'
@@ -148,3 +157,4 @@ jobs:
             --add-label "🔴 SECURITY CRITICAL"
           echo "::error::🔒 Firestore ルールに致命的なセキュリティ問題が見つかりました。"
           exit 1
+WORKFLOW_FILE_EOF
