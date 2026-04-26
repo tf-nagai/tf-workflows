@@ -102,11 +102,12 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          SOURCE=$(cat source_bundle.txt)
-          CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
           PROJECT="${{ inputs.project_name }}"
+          DATE=$(date +%Y-%m-%d)
 
-          SYSTEM_PROMPT="あなたは Firebase アプリの品質監査員です。
+          # SYSTEM_PROMPT をファイルに書き出す（jq の --rawfile で読み込むため）
+          cat > /tmp/system_prompt.txt <<SYS_EOF
+          あなたは Firebase アプリの品質監査員です。
           プロジェクト「${PROJECT}」の週次全量スキャンを実施してください。
 
           ## スキャン観点
@@ -117,7 +118,7 @@ jobs:
 
           ## 出力フォーマット
           # 週次スキャンレポート: ${PROJECT}
-          ## 日付: $(date +%Y-%m-%d)
+          ## 日付: ${DATE}
 
           ### サマリー
           - 🔴致命: X件 / 🟡警告: X件 / 🔵情報: X件
@@ -129,26 +130,34 @@ jobs:
           （設計の一貫性、技術的負債について）
 
           ### 推奨アクション
-          （優先度順）"
+          （優先度順）
+          SYS_EOF
 
+          # JSON リクエストを jq で組み立ててファイルに保存（ARG_MAX 制限回避）
+          # --rawfile でファイルから直接読み込み、--arg のサイズ制限を回避
+          jq -n \
+            --rawfile system /tmp/system_prompt.txt \
+            --rawfile checklist tf-workflows/prompts/checklist.md \
+            --rawfile source source_bundle.txt \
+            '{
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 8192,
+              system: $system,
+              messages: [{
+                role: "user",
+                content: "## チェックリスト\n\n\($checklist)\n\n## ソースコード\n\($source)\n\n週次全量スキャンを実施してください。"
+              }]
+            }' > /tmp/request.json
+
+          REQ_SIZE=$(wc -c < /tmp/request.json)
+          echo "📤 リクエストサイズ: ${REQ_SIZE} bytes"
+
+          # ファイル経由で curl に渡す（@ プレフィックス）
           RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
-            -d "$(jq -n \
-              --arg system "$SYSTEM_PROMPT" \
-              --arg checklist "$CHECKLIST" \
-              --arg source "$SOURCE" \
-              '{
-                model: "claude-sonnet-4-20250514",
-                max_tokens: 8192,
-                system: $system,
-                messages: [{
-                  role: "user",
-                  content: "## チェックリスト\n\n\($checklist)\n\n## ソースコード\n\($source)\n\n週次全量スキャンを実施してください。"
-                }]
-              }'
-            )")
+            --data @/tmp/request.json)
 
           # デバッグ: APIレスポンスのエラー内容を確認できるようにログ出力
           # API_KEY や本文などの機密値は含まれないはずだが、念のため type と error のみ抜粋
