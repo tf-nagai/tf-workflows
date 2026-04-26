@@ -59,12 +59,16 @@ jobs:
             echo "firestore.rules" >> all_sources.txt
           fi
 
-          # .env* の存在チェック
+          # .env* の存在チェック（複数行になるので heredoc 形式で出力）
           ENV_FILES=$(find . -name ".env*" -not -path "./.git/*" 2>/dev/null || true)
-          echo "env_files=$ENV_FILES" >> "$GITHUB_OUTPUT"
+          {
+            echo "env_files<<ENV_FILES_EOF"
+            echo "$ENV_FILES"
+            echo "ENV_FILES_EOF"
+          } >> "$GITHUB_OUTPUT"
 
           # ファイル一覧
-          FILE_COUNT=$(wc -l < all_sources.txt)
+          FILE_COUNT=$(wc -l < all_sources.txt | tr -d ' ')
           echo "file_count=$FILE_COUNT" >> "$GITHUB_OUTPUT"
           echo "📁 スキャン対象: $FILE_COUNT ファイル"
 
