@@ -150,7 +150,19 @@ jobs:
               }'
             )")
 
+          # デバッグ: APIレスポンスのエラー内容を確認できるようにログ出力
+          # API_KEY や本文などの機密値は含まれないはずだが、念のため type と error のみ抜粋
+          echo "🔍 API レスポンス診断:"
+          echo "$RESPONSE" | jq -r '{type: .type, error: .error, model: .model, stop_reason: .stop_reason, content_len: (.content | length // 0)}'
+
           SCAN_RESULT=$(echo "$RESPONSE" | jq -r '.content[0].text // "スキャン失敗"')
+
+          # スキャン失敗だった場合はエラー内容を表示して非ゼロ終了させる
+          if [ "$SCAN_RESULT" = "スキャン失敗" ]; then
+            echo "::error::Anthropic API 呼び出しに失敗しました。レスポンス内容:"
+            echo "$RESPONSE" | jq -r '.error // "（error フィールドなし）"'
+            exit 1
+          fi
 
           echo "scan_result<<SCAN_EOF" >> "$GITHUB_OUTPUT"
           echo "$SCAN_RESULT" >> "$GITHUB_OUTPUT"
