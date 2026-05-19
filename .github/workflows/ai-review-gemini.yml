@@ -41,18 +41,20 @@ jobs:
           sparse-checkout: prompts
 
       - name: Run Gemini Review
+        id: review
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          DIFF=$(cat pr_diff.txt)
           SYSTEM_PROMPT=$(cat tf-workflows/prompts/gemini-review-prompt.md)
           CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
 
-          # リクエストJSONをファイルに書き出し（シェル展開の問題を回避）
+          # リクエストJSONをファイルに書き出し
+          # ARG_MAX 回避のため diff は --rawfile でファイルから直接読み込む
+          # （weekly-scan.yml 4/26 修正と同じパターン）
           jq -n \
             --arg prompt "$SYSTEM_PROMPT" \
             --arg checklist "$CHECKLIST" \
-            --arg diff "$DIFF" \
+            --rawfile diff pr_diff.txt \
             --arg phase "${{ inputs.phase }}" \
             '{
               system_instruction: { parts: [{ text: $prompt }] },
@@ -67,21 +69,33 @@ jobs:
               }
             }' > /tmp/gemini_request.json
 
-          # Gemini API 呼び出し
+          REQ_SIZE=$(wc -c < /tmp/gemini_request.json)
+          echo "📤 Gemini リクエストサイズ: ${REQ_SIZE} bytes"
+
+          # Gemini API 呼び出し（ファイル経由で渡す）
           HTTP_CODE=$(curl -s -o /tmp/gemini_response.json -w "%{http_code}" \
             "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$GEMINI_API_KEY" \
             -H "Content-Type: application/json" \
-            -d @/tmp/gemini_request.json)
+            --data @/tmp/gemini_request.json)
 
-          echo "Gemini API HTTP status: $HTTP_CODE"
+          echo "🔍 Gemini API HTTP status: $HTTP_CODE"
 
           if [ "$HTTP_CODE" != "200" ]; then
-            echo "API Error Response:"
-            cat /tmp/gemini_response.json
-            echo "レビュー結果の取得に失敗しました（HTTP $HTTP_CODE）" > /tmp/review_body.md
-          else
-            jq -r '.candidates[0].content.parts[0].text // "レビュー結果の取得に失敗しました"' /tmp/gemini_response.json > /tmp/review_body.md
+            echo "::error::Gemini API 呼び出しに失敗しました（HTTP $HTTP_CODE）"
+            echo "--- response body ---"
+            cat /tmp/gemini_response.json || true
+            exit 1
           fi
+
+          REVIEW_BODY=$(jq -r '.candidates[0].content.parts[0].text // empty' /tmp/gemini_response.json)
+          if [ -z "$REVIEW_BODY" ]; then
+            echo "::error::Gemini API のレスポンスから本文を抽出できませんでした"
+            echo "--- response body ---"
+            jq '.' /tmp/gemini_response.json || cat /tmp/gemini_response.json
+            exit 1
+          fi
+
+          printf '%s\n' "$REVIEW_BODY" > /tmp/review_body.md
 
           if grep -q "🔴致命" /tmp/review_body.md; then
             echo "has_critical=true" >> "$GITHUB_OUTPUT"
