@@ -46,35 +46,57 @@ jobs:
           sparse-checkout: prompts
 
       - name: Run Claude Review
+        id: review
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          DIFF=$(cat pr_diff.txt)
           SYSTEM_PROMPT=$(cat tf-workflows/prompts/claude-review-prompt.md)
           CHECKLIST=$(cat tf-workflows/prompts/checklist.md)
 
-          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+          # リクエストJSONをファイルに書き出し（ARG_MAX 回避のため diff は --rawfile 経由）
+          jq -n \
+            --arg system "$SYSTEM_PROMPT" \
+            --arg checklist "$CHECKLIST" \
+            --rawfile diff pr_diff.txt \
+            --arg phase "${{ inputs.phase }}" \
+            --arg level "${{ inputs.review_level }}" \
+            '{
+              model: "claude-sonnet-4-20250514",
+              max_tokens: 4096,
+              system: $system,
+              messages: [{
+                role: "user",
+                content: ("## チェックリスト（Phase " + $phase + "）\n\n" + $checklist + "\n\n## レビュー強度\n" + $level + "\n\n## PR差分\n```diff\n" + $diff + "\n```\n\n上記の差分をチェックリストに沿ってレビューしてください。")
+              }]
+            }' > /tmp/claude_request.json
+
+          # Anthropic API 呼び出し（HTTP ステータスを取得してサイレント失敗を防ぐ）
+          HTTP_CODE=$(curl -s -o /tmp/claude_response.json -w "%{http_code}" \
+            https://api.anthropic.com/v1/messages \
             -H "Content-Type: application/json" \
             -H "x-api-key: $ANTHROPIC_API_KEY" \
             -H "anthropic-version: 2023-06-01" \
-            -d "$(jq -n \
-              --arg system "$SYSTEM_PROMPT" \
-              --arg checklist "$CHECKLIST" \
-              --arg diff "$DIFF" \
-              --arg phase "${{ inputs.phase }}" \
-              --arg level "${{ inputs.review_level }}" \
-              '{
-                model: "claude-sonnet-4-20250514",
-                max_tokens: 4096,
-                system: $system,
-                messages: [{
-                  role: "user",
-                  content: "## チェックリスト（Phase \($phase)）\n\n\($checklist)\n\n## レビュー強度\n\($level)\n\n## PR差分\n```diff\n\($diff)\n```\n\n上記の差分をチェックリストに沿ってレビューしてください。"
-                }]
-              }'
-            )")
+            --data @/tmp/claude_request.json)
 
-          echo "$RESPONSE" | jq -r '.content[0].text // "レビュー結果の取得に失敗しました"' > /tmp/review_body.md
+          echo "🔍 Claude API HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Claude API 呼び出しに失敗しました（HTTP $HTTP_CODE）"
+            echo "--- response body ---"
+            cat /tmp/claude_response.json || true
+            exit 1
+          fi
+
+          # レスポンス JSON から本文を抽出。空ならワークフローを fail させる
+          REVIEW_BODY=$(jq -r '.content[0].text // empty' /tmp/claude_response.json)
+          if [ -z "$REVIEW_BODY" ]; then
+            echo "::error::Claude API のレスポンスから content[0].text を抽出できませんでした"
+            echo "--- response body ---"
+            jq '.' /tmp/claude_response.json || cat /tmp/claude_response.json
+            exit 1
+          fi
+
+          printf '%s\n' "$REVIEW_BODY" > /tmp/review_body.md
 
           if grep -q "🔴致命" /tmp/review_body.md; then
             echo "has_critical=true" >> "$GITHUB_OUTPUT"
