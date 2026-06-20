@@ -61,7 +61,7 @@ jobs:
             --arg phase "${{ inputs.phase }}" \
             --arg level "${{ inputs.review_level }}" \
             '{
-              model: "claude-sonnet-4-20250514",
+              model: "claude-sonnet-4-6",
               max_tokens: 4096,
               system: $system,
               messages: [{

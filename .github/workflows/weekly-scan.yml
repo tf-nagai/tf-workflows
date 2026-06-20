@@ -140,7 +140,7 @@ jobs:
             --rawfile checklist tf-workflows/prompts/checklist.md \
             --rawfile source source_bundle.txt \
             '{
-              model: "claude-sonnet-4-20250514",
+              model: "claude-sonnet-4-6",
               max_tokens: 8192,
               system: $system,
               messages: [{
